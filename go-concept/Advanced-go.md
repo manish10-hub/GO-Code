@@ -265,6 +265,38 @@ for {
      ↓
    Infinite loop
 
+```go
+//This pattern lets a select continue processing the remaining active channels without spinning on channels that have already been closed
+func main() {
+	ch1 := producer("A", 3)
+	ch2 := producer("B", 5)
+
+	// Continue until both channels are disabled.
+	for ch1 != nil || ch2 != nil {
+
+		select {
+		case msg, ok := <-ch1:
+			if !ok {
+				fmt.Println("Producer A finished")
+				ch1 = nil // Disable this select case.
+				continue
+			}
+			fmt.Println(msg)
+
+		case msg, ok := <-ch2:
+			if !ok {
+				fmt.Println("Producer B finished")
+				ch2 = nil // Disable this select case.
+				continue
+			}
+			fmt.Println(msg)
+		}
+	}
+
+	fmt.Println("All producers finished")
+}
+```
+
 2. **Reading from a Closed Channel**
    - Allowed in Go. First you get any remaining buffered values; after the buffer is empty, receive returns zero value and `ok = false`.
    - **Best practice:** Use the "comma-ok" idiom (`v, ok := <-ch`) or `for range` to safely drain channels.
@@ -381,6 +413,7 @@ fmt.Println(data) // PROBLEM: May print 0
 
 - **Data Race (raw memory conflict):** Two concurrent execution threads access the exact same memory location simultaneously without synchronization, and at least one access is a write. This causes raw undefined behavior/memory corruption.
 - **Race Condition (flawed business logic):** The code is perfectly synchronized (no data corruption occurs, often protected by mutexes), but the order of execution alters the final outcome incorrectly.
+```go
 func Purchase(a *Account, amount int) bool {
 	a.mu.Lock()
 	ok := a.balance >= amount
@@ -395,6 +428,7 @@ func Purchase(a *Account, amount int) bool {
 	a.mu.Unlock()
 	return true
 }
+```
 
 ---
 
@@ -1057,6 +1091,7 @@ go func() {
 
 - An interface value is internally `{type, value}`. It is only `== nil` when **both** the type and value are nil.
 - A non-nil interface holding a nil pointer is **not equal to nil**.
+```go
 +-------------------+
 | Type  = *Person   |
 | Value = nil       |
@@ -1064,7 +1099,6 @@ go func() {
 
 != nil
 
-```go
 type MyError struct{}
 func (e *MyError) Error() string { return "boom" }
 
@@ -1192,11 +1226,40 @@ fmt.Println(d.Speak()) // "Rex makes a sound" — promoted method
 - If you need ordered output, extract keys into a slice and sort them explicitly.
 
 ```go
-keys := make([]string, 0, len(m))
-for k := range m {
-    keys = append(keys, k)
+package main
+
+import (
+	"fmt"
+	"sort"
+)
+
+func main() {
+
+	// Step 1: Create a map
+	ages := map[string]int{
+		"Charlie": 30,
+		"Alice":   25,
+		"Bob":     28,
+		"David":   35,
+	}
+
+	// Step 2: Create a slice to hold all keys
+	keys := make([]string, 0, len(ages))
+
+	// Step 3: Copy keys from map into slice
+	for key := range ages {
+		keys = append(keys, key)
+	}
+
+	// Step 4: Sort the keys alphabetically
+	sort.Strings(keys)
+
+	// Step 5: Iterate using sorted keys
+	for _, key := range keys {
+		fmt.Printf("%s -> %d\n", key, ages[key])
+	}
 }
-sort.Strings(keys)
+
 ```
 
 ---

@@ -101,6 +101,73 @@ CRD
 └── Conversion Strategy (optional)
 ```
 
+```
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: storagevolumes.storage.ibm.com
+
+spec:
+  group: storage.ibm.com
+
+  names:
+    kind: StorageVolume
+    plural: storagevolumes
+    singular: storagevolume
+    shortNames:
+      - sv
+
+  scope: Namespaced
+
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+
+      schema:
+        openAPIV3Schema:
+          type: object
+
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: integer
+                pool:
+                  type: string
+                encrypted:
+                  type: boolean
+
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                volumeID:
+                  type: string
+
+      subresources:
+        status: {}
+
+      additionalPrinterColumns:
+        - name: Size
+          type: integer
+          jsonPath: .spec.size
+
+        - name: Pool
+          type: string
+          jsonPath: .spec.pool
+
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+```
+
 ---
 
 ### Q7. What is the difference between `spec` and `status` in a Custom Resource?
@@ -202,7 +269,9 @@ Each phase maps to specific reconciliation logic. The Operator checks the curren
 
 ### Q12. What is Owner Reference and why is it important for Operators?
 
+Owner References are one of the most important concepts when writing Kubernetes Operators. They allow Kubernetes to automatically clean up child resources when the parent is deleted
 Owner Reference is a field on a Kubernetes object that points to another object that owns it. When the owner is deleted, Kubernetes garbage collects all owned objects automatically — this is called cascading deletion.
+The OwnerReference ensures Kubernetes-native child resources (PVCs, Jobs, Secrets, etc.) are automatically garbage-collected.
 
 In Operators, you set owner references on every object your Operator creates (Pods, Services, ConfigMaps, PVCs) to point to the parent Custom Resource.
 
@@ -412,11 +481,50 @@ For example, if your primary resource is an ImageArchive (which you reconcile), 
 
 To set this up, you use the `Watches()` or `Owns()` chains when building your controller manager.
 
+In controller-runtime, the primary resource is registered using For(), while secondary resources are registered using Owns() or Watches().
+
+Owns() is used when the secondary resource has an OwnerReference pointing to the primary resource. When the secondary resource changes, controller-runtime follows the OwnerReference, determines the owning resource, and enqueues a reconcile request for the parent. This is the most common pattern for resources like Pods, Jobs, Deployments, or PVCs created by an Operator.
+
+If the secondary resource isn't owned by the primary resource, Watches() is used with a mapping function (EnqueueRequestsFromMapFunc) to explicitly determine which primary resources should be reconciled when that secondary resource changes.
+
+```go
+// Own
+func (r *ZonalImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&imagev1beta1.ZonalImage{}).
+        Owns(&batchv1.Job{}).
+        Complete(r)
+}
+
+// Watch
+ctrl.NewControllerManagedBy(mgr).
+    For(&StorageVolume{}).
+    Watches(
+        &source.Kind{Type: &corev1.ConfigMap{}},
+        handler.EnqueueRequestsFromMapFunc(...),
+    )
+
+// Watch and Own
+func (r *ZonalImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&imagev1beta1.ZonalImage{}).      // Primary resource
+		Owns(&batchv1.Job{}).                 // Owned secondary resource
+		Owns(&corev1.ConfigMap{}).            // Another owned resource
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.mapSecretToZonalImages),
+		).                                    // Custom watch
+		Complete(r)
+}
+
+```
 ---
 
 ### Q26. What are Predicates in controller-runtime and how do you use them to reduce unnecessary reconciliations?
 
 Predicates are filters that sit between the watch event and the work queue. If a predicate returns false, the event is dropped and the reconciler is never called. This reduces unnecessary reconciliations and saves CPU.
+
+Predicates are event filters in controller-runtime that determine whether an event should enqueue a reconcile request. They help reduce unnecessary reconciliations by filtering out events the controller doesn't care about, such as status-only updates or metadata changes.
 
 **Built-in predicates:**
 - `GenerationChangedPredicate` — only spec changes, not status updates
@@ -426,9 +534,35 @@ Predicates are filters that sit between the watch event and the work queue. If a
 
 Custom predicates implement the `Predicate` interface.
 
+```go
+type SizeChangedPredicate struct {
+	predicate.Funcs
+}
+
+func (SizeChangedPredicate) Update(e event.UpdateEvent) bool {
+
+	oldObj := e.ObjectOld.(*storagev1.StorageVolume)
+	newObj := e.ObjectNew.(*storagev1.StorageVolume)
+
+	return oldObj.Spec.Size != newObj.Spec.Size
+}
+
+func (r *StorageVolumeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(
+			&storagev1.StorageVolume{},
+			builder.WithPredicates(SizeChangedPredicate{}),
+		).
+		Complete(r)
+}
+```
+
 ---
 
 ### Q27. What is the dynamic client in client-go and when do you use it over the typed clientset?
+
+The dynamic client in client-go is not limited to Custom Resources. It can interact with both built-in Kubernetes resources and CRDs. The key difference is that it operates on unstructured.Unstructured objects rather than generated Go types. This makes it ideal for generic tools, plugins, or controllers that need to work with arbitrary Kubernetes resources without having compile-time knowledge of their schemas. For strongly typed controllers that manage known resources, the typed client or controller-runtime client is generally preferred because it provides compile-time type safety and a better developer experience.
 
 The typed clientset only works with built-in Kubernetes resource types (Pods, Deployments, etc.) because it uses generated Go types. For Custom Resources, you either:
 
@@ -532,6 +666,80 @@ Each controller (or application manager) registers its own Event Handler (callba
  ║       │  Reconcile Loop   │       ║  ║       │  Reconcile Loop   │       ║
  ║       └───────────────────┘       ║  ║       └───────────────────┘       ║
  ╚═══════════════════════════════════╝  ╚═══════════════════════════════════╝
+```
+
+```
++--------------------------------------------------------------------------------+
+|                      controller-runtime Manager                                |
+|                                                                                |
+|  +------------------------------------------------------------------------+    |
+|  |                    SharedInformerFactory (client-go)                   |    |
+|  |                                                                        |    |
+|  |   +-------------------+      +--------------------+                    |    |
+|  |   | SharedInformer    |      | SharedInformer     |                    |    |
+|  |   | (StorageVolume)   |      | (ImageArchive)     |                    |    |
+|  |   +-------------------+      +--------------------+                    |    |
+|  |            |                           |                               |    |
+|  +------------|---------------------------|-------------------------------+    |
+|               |                           |                                    |
+|               ▼                           ▼                                    |
+|      +------------------+       +------------------+                           |
+|      | Local Cache      |       | Local Cache      |                           |
+|      | (Indexer/Store)  |       | (Indexer/Store)  |                           |
+|      +------------------+       +------------------+                           |
+|               |                           |                                    |
+|               +------------+--------------+                                    |
+|                            |                                                   |
+|                            ▼                                                   |
+|                  controller-runtime Cache                                      |
+|                            |                                                   |
+|      +---------------------+-------------------------+                         |
+|      |                                               |                         |
+|      ▼                                               ▼                         |
+| Controller A                                 Controller B                      |
+|      |                                               |                         |
+|      ▼                                               ▼                         |
+| EventHandler                                  EventHandler                     |
+|      |                                               |                         |
+|      ▼                                               ▼                         |
+| WorkQueue                                     WorkQueue                        |
+|      |                                               |                         |
+|      ▼                                               ▼                         |
+| Reconcile()                                   Reconcile()                      |
+|      |                                               |                         |
+|      +-------------------+-----------------------+                             |
+|                          |                                                     |
+|                          ▼                                                     |
+|                  client.Get()/List()                                           |
+|                          |                                                     |
+|                          ▼                                                     |
+|             Reads from controller-runtime Cache                                |
++--------------------------------------------------------------------------------+
+```
+
+```
+// This is shared informer and cache 
+                    Manager
+                       │
+             controller-runtime Cache
+                       │
+      +----------------+----------------+
+      |                                 |
+      ▼                                 ▼
+SharedInformer                  SharedInformer
+(StorageVolume)                 (ImageArchive)
+      │                                 │
+      ▼                                 ▼
+ Reflector                         Reflector
+      │                                 │
+ LIST/WATCH                       LIST/WATCH
+      │                                 │
+      ▼                                 ▼
+ DeltaFIFO                        DeltaFIFO
+      │                                 │
+      ▼                                 ▼
+ Indexer                          Indexer
+(Local Cache)                   (Local Cache)
 ```
 
 **Note:** The filtering logic sits on each controller's registration block, but it is executed by the Shared Pod Informer thread right before it attempts to hand the event over to that specific controller.
@@ -691,7 +899,7 @@ When you Update an object, you must include the current resourceVersion. If anot
 *End of guide. Read top to bottom the night before — Level 1 is recall/definitions, Level 2 builds on CRD and controller-runtime basics, Level 3 covers triggering mechanics and design tradeoffs, and Level 4 is internals/production tuning — the depth Staff/Principal rounds probe for.*
 
 
-
+```
 =========================================================================================================
                                      KUBERNETES CONTROL PLANE
 =========================================================================================================
@@ -747,7 +955,7 @@ When you Update an object, you must include the current resourceVersion. If anot
  ║                                     - Directly calls the Indexer Store to fetch data ────────┘     ║
  ║                                       without crossing the network network.                  ║
  ╚═════════════════════════════════════════════════════════════════════════════════════════════════════╝
-
+```
 
  # Kubernetes Operators — Part 2
 ### RBAC for Operators & Admission Webhooks (Beginner → Expert)
