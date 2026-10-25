@@ -1,67 +1,35 @@
-package concurrency
+package main
 
 import (
-	"context"
-	"sync"
+	"fmt"
 )
 
 type BoundedQueue struct {
-	capacity int
-	items    []interface{}
-	head     int
-	tail     int
-	count    int
-	lock     sync.Mutex
-	notFull  *sync.Cond
-	notEmpty *sync.Cond
+	ch chan int
 }
 
 func NewBoundedQueue(capacity int) *BoundedQueue {
-	bq := &BoundedQueue{
-		capacity: capacity,
-		items:    make([]interface{}, capacity),
+	return &BoundedQueue{
+		ch: make(chan int, capacity),
 	}
-	bq.notFull = sync.NewCond(&bq.lock)
-	bq.notEmpty = sync.NewCond(&bq.lock)
-	return bq
 }
 
-func (bq *BoundedQueue) Enqueue(ctx context.Context, item interface{}) bool {
-	bq.lock.Lock()
-	defer bq.lock.Unlock()
-
-	for bq.count == bq.capacity {
-		// Check context status inside loop to prevent lock sleep leaks
-		if ctx.Err() != nil {
-			return false
-		}
-		bq.notFull.Wait()
-	}
-
-	bq.items[bq.tail] = item
-	bq.tail = (bq.tail + 1) % bq.capacity
-	bq.count++
-
-	bq.notEmpty.Signal()
-	return true
+func (q *BoundedQueue) Enqueue(value int) {
+	q.ch <- value
 }
 
-func (bq *BoundedQueue) Dequeue(ctx context.Context) (interface{}, bool) {
-	bq.lock.Lock()
-	defer bq.lock.Unlock()
+func (q *BoundedQueue) Dequeue() int {
+	return <-q.ch
+}
 
-	for bq.count == 0 {
-		if ctx.Err() != nil {
-			return nil, false
-		}
-		bq.notEmpty.Wait()
-	}
+func main() {
+	queue := NewBoundedQueue(3)
 
-	item := bq.items[bq.head]
-	bq.items[bq.head] = nil // Avoid memory leaks
-	bq.head = (bq.head + 1) % bq.capacity
-	bq.count--
+	queue.Enqueue(10)
+	queue.Enqueue(20)
+	queue.Enqueue(30)
 
-	bq.notFull.Signal()
-	return item, true
+	fmt.Println(queue.Dequeue())
+	fmt.Println(queue.Dequeue())
+	fmt.Println(queue.Dequeue())
 }

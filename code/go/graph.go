@@ -92,7 +92,7 @@ func hasCycle(node int, graph map[int][]int) bool {
 				if helper(neighbor, graph, visited, track) {
 					return true
 				}
-			} else {
+			} else if{
 				if track[neighbor] {
 					return true
 				}

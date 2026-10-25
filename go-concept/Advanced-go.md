@@ -224,6 +224,7 @@ ctx := context.WithValue(context.Background(),RequestID,"abc123")
   - Handling multiple outputs.
   - Coordinating cancellation/timeouts.
 
+```go
 for {
 
 	select {
@@ -238,6 +239,7 @@ for {
 		fmt.Println("Processing", job)
 	}
 }
+```
 
 
 ---
@@ -335,6 +337,42 @@ func foo() *int {
 }
 ```
 - `x` must survive after `foo` returns, so it's on the heap.
+
+```go
+// The slice header itself is often still on the stack, but Underlying Array in Heap
+func foo() []int {
+    s := []int{1, 2, 3}
+    return s
+}
+Stack
+
++----------------------+
+| Slice Header         |
+| Data -----------+
+| Len = 3         |
+| Cap = 3         |
++-----------------+
+
+Heap
+
++-----------------------+
+| Underlying Array      |
+| 1 | 2 | 3             |
++-----------------------+
+
+
+// The slice header and Underlying Array in Heap
+func foo() *[]int {
+    s := []int{1,2,3}
+    return &s
+}
+
+
+// In Append, If capacity is full Allocates new array in Heap
+s := []int{1,2,3}
+
+s = append(s, 4)
+```
 - **To check:** `go build -gcflags="-m" file.go`
 
 ---

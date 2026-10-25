@@ -1,0 +1,8 @@
+Cisco Prepration
+
+1: Go Basic and Advanced
+2: Go programming
+3: Docker
+4: K8s
+5: K8s Networking
+6: System Design

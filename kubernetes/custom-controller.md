@@ -1296,3 +1296,1214 @@ failurePolicy: Ignore   →  if the webhook is unreachable, ALLOW the request th
 ---
 
 *End of Part 2. Pair with `custom-controller-organized.md` for full Operator interview coverage — concepts/internals there, permissions and admission control here.*
+
+
+
+
+
+
+
+
+
+
+Step 1 — Define the CRD
+Step 2 — Create a Custom Resource
+Step 3 — Define Go API types. //pkg/apis/storage/v1/types.go
+Step 4 — Register the type with a Scheme
+```
+storage.example.com/v1
+        +
+VolumeBackup
+        ↓
+Go type: VolumeBackup
+```
+Step 5 — DeepCopy //They are generated
+Step 6 — Create the client //Generated code would provide methods roughly like
+```
+VolumeBackups(namespace).Get(...)
+VolumeBackups(namespace).List(...)
+VolumeBackups(namespace).Create(...)
+VolumeBackups(namespace).Update(...)
+```
+Step 7 — Create an Informer
+Step 8 — Work Queue
+Step 9 — Controller
+Step 10. Worker
+Step 10 — Reconcile
+Step 11. Let's put actual business logic
+Where does RBAC fit?
+
+
+
+This is the part I'd emphasize in your interview.
+
+                     YOU WRITE
+                        │
+        ┌───────────────┼─────────────────┐
+        │               │                 │
+        ▼               ▼                 ▼
+      CRD YAML       Go API Types      Controller
+        │               │                 │
+        │               │                 │
+        ▼               ▼                 ▼
+    Schema          Spec/Status       Reconcile()
+                                        │
+                                        ▼
+                                  Business Logic
+
+
+                   GENERATED / PROVIDED
+                        │
+        ┌───────────────┼─────────────────┐
+        │               │                 │
+        ▼               ▼                 ▼
+    DeepCopy       Typed Client       Informer
+                                        │
+                                        ▼
+                                   LIST/WATCH
+                                   Local Cache
+
+
+
+                Controller
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+      client-go          controller-runtime
+          │                   │
+          ▼                   ▼
+   Informer/Queue/etc.   Manager/Controller
+                              │
+                              ▼
+                         Reconcile()
+
+
+
+
+
+
+
+
+# Introducing a New CRD + Controller in Kubernetes
+### Complete Flow — From Definition to `kubectl` Management
+### Interview-Oriented: Every Change, Every File, Every Reason
+
+---
+
+## The Big Picture — What You Are Building
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     What you need to create                         │
+│                                                                     │
+│  1. API Types (Go structs)   → defines what the CRD looks like     │
+│  2. CRD manifest (YAML)      → registers the CRD in Kubernetes     │
+│  3. Controller (Go)          → watches and reconciles the CRD      │
+│  4. RBAC (YAML)              → grants controller permissions        │
+│  5. Deployment (YAML)        → runs the controller as a pod        │
+└─────────────────────────────────────────────────────────────────────┘
+
+How they connect:
+
+ User runs:                 Controller watches:          Controller manages:
+ kubectl apply              API Server notifies          Secondary resources
+ -f myapp.yaml              controller via informer      (Pods, Services,
+      │                          │                        ConfigMaps...)
+      ▼                          ▼                             │
+ [MyApp CR] ──────────► [Reconcile Loop] ─────────────────────┘
+  stored in etcd           reads CR spec
+                           compares to current state
+                           creates/updates/deletes resources
+```
+
+---
+
+## The Example We Will Use Throughout
+
+We are building a `WebApp` CRD. When a user creates a `WebApp` resource,
+the controller automatically:
+- Creates a `Deployment` with the specified number of replicas and image
+- Creates a `Service` to expose it
+- Updates `WebApp.Status` with the current state
+
+```yaml
+# What the user writes:
+apiVersion: apps.example.com/v1
+kind: WebApp
+metadata:
+  name: my-webapp
+spec:
+  replicas: 3
+  image: nginx:1.25
+  port: 8080
+
+# What the controller does automatically:
+# → Creates Deployment: my-webapp (3 replicas, nginx:1.25)
+# → Creates Service: my-webapp (port 8080)
+# → Updates status.availableReplicas, status.phase
+```
+
+---
+
+## Step 1 — API Types (Go Structs)
+
+### File: `api/v1/webapp_types.go`
+
+### What it is
+
+The Go structs that define the schema of your CRD. This is the
+**source of truth** for what fields the CRD accepts, what validation
+applies, and what the status looks like.
+
+### The code
+
+```go
+package v1
+
+import (
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// WebAppSpec — desired state declared by the user (the "spec")
+// +kubebuilder:validation:Optional
+type WebAppSpec struct {
+    // Replicas is the number of pod replicas to run
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=100
+    Replicas int32 `json:"replicas"`
+
+    // Image is the container image to run
+    // +kubebuilder:validation:Required
+    Image string `json:"image"`
+
+    // Port is the container port to expose
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=65535
+    Port int32 `json:"port,omitempty"`
+}
+
+// WebAppStatus — current observed state written by the controller (the "status")
+type WebAppStatus struct {
+    // Phase is the current lifecycle phase of the WebApp
+    // +kubebuilder:validation:Enum=Pending;Running;Degraded;Failed
+    Phase string `json:"phase,omitempty"`
+
+    // AvailableReplicas is the number of pods currently available
+    AvailableReplicas int32 `json:"availableReplicas,omitempty"`
+
+    // Conditions is a list of current observed conditions
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+    // ObservedGeneration is the CR generation the controller last reconciled
+    // This tells users whether the controller has processed the latest spec
+    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// WebApp is the Schema for the webapps API
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=wa;webapp
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="Available",type=integer,JSONPath=`.status.availableReplicas`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+type WebApp struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+    Spec   WebAppSpec   `json:"spec,omitempty"`
+    Status WebAppStatus `json:"status,omitempty"`
+}
+
+// WebAppList contains a list of WebApp
+// +kubebuilder:object:root=true
+type WebAppList struct {
+    metav1.TypeMeta `json:",inline"`
+    metav1.ListMeta `json:"metadata,omitempty"`
+    Items           []WebApp `json:"items"`
+}
+
+func init() {
+    SchemeBuilder.Register(&WebApp{}, &WebAppList{})
+}
+```
+
+### Why each part matters
+
+**`TypeMeta` and `ObjectMeta`:**
+Every Kubernetes object needs TypeMeta (`apiVersion`, `kind`) and
+ObjectMeta (`name`, `namespace`, `labels`, `annotations`, `resourceVersion`).
+These are embedded via composition — your CRD inherits all standard
+Kubernetes object behaviour for free.
+
+**`json:"..."` tags:**
+Tell the JSON serializer how to map Go fields to JSON keys. Kubernetes
+stores all objects as JSON in etcd. The tag `json:"replicas"` means
+the user writes `spec.replicas:` in their YAML.
+
+**`+kubebuilder:` marker comments:**
+These are not just comments — the `controller-gen` tool reads them
+to generate the CRD YAML and RBAC manifests automatically.
+
+| Marker | What it generates |
+|---|---|
+| `+kubebuilder:object:root=true` | Registers this as a root CRD object |
+| `+kubebuilder:subresource:status` | Enables `/status` subresource (separate RBAC for status updates) |
+| `+kubebuilder:resource:shortName=wa` | Lets users run `kubectl get wa` instead of `kubectl get webapps` |
+| `+kubebuilder:printcolumn:...` | Custom columns in `kubectl get webapps` output |
+| `+kubebuilder:validation:Minimum=1` | Adds OpenAPI validation to the generated CRD schema |
+
+**`ObservedGeneration` in status:**
+This is a Kubernetes best practice. The controller always sets
+`status.observedGeneration = metadata.generation`. Users can check
+whether the controller has processed their latest spec change by
+comparing these two values. If `observedGeneration < generation`,
+the controller has not reconciled the latest spec yet.
+
+**`metav1.Condition` in status:**
+The standard Kubernetes condition type for communicating resource health.
+Has fields: `Type`, `Status` (True/False/Unknown), `Reason`, `Message`,
+`ObservedGeneration`, `LastTransitionTime`. Use this instead of custom
+boolean fields — it is the Kubernetes API convention.
+
+---
+
+### File: `api/v1/groupversion_info.go`
+
+```go
+package v1
+
+import (
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    "sigs.k8s.io/controller-runtime/pkg/scheme"
+)
+
+var (
+    // GroupVersion is the API group and version for this API
+    GroupVersion = schema.GroupVersion{
+        Group:   "apps.example.com",
+        Version: "v1",
+    }
+
+    // SchemeBuilder adds our types to the runtime scheme
+    SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+
+    // AddToScheme adds the types from this group/version to the given scheme
+    AddToScheme = SchemeBuilder.AddToScheme
+)
+```
+
+**Why this file exists:**
+Kubernetes uses a runtime `Scheme` — a registry that maps
+`(Group, Version, Kind)` strings to Go types. Without registering your
+types, the API server and controller cannot serialize/deserialize your
+objects. `GroupVersion` declares: "our CRD belongs to API group
+`apps.example.com`, version `v1`." The `AddToScheme` function is called
+at startup to register `WebApp` and `WebAppList` so the controller can
+work with them.
+
+---
+
+## Step 2 — Generate the CRD YAML
+
+### What changes and why
+
+```bash
+# Run controller-gen to generate CRD manifest from your Go types
+make generate    # generates DeepCopyObject methods
+make manifests   # generates CRD YAML and RBAC from markers
+```
+
+### File: `config/crd/bases/apps.example.com_webapps.yaml`
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: webapps.apps.example.com    # must be: plural.group
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
+spec:
+  group: apps.example.com           # API group
+  names:
+    kind: WebApp                    # CamelCase — what you write in YAML
+    listKind: WebAppList            # used for list responses
+    plural: webapps                 # URL path: /apis/apps.example.com/v1/webapps
+    singular: webapp                # used in kubectl output
+    shortNames:
+    - wa                            # kubectl get wa (from +kubebuilder:resource)
+  scope: Namespaced                 # or Cluster
+  versions:
+  - name: v1
+    served: true                    # this version is active
+    storage: true                   # this version is stored in etcd
+
+    # Status subresource — separates spec and status update permissions
+    subresources:
+      status: {}
+
+    # Additional kubectl get columns (from +kubebuilder:printcolumn markers)
+    additionalPrinterColumns:
+    - name: Phase
+      type: string
+      jsonPath: .status.phase
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    - name: Available
+      type: integer
+      jsonPath: .status.availableReplicas
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+
+    # OpenAPI v3 schema — generated from your Go structs and markers
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required:
+            - replicas
+            - image
+            properties:
+              replicas:
+                type: integer
+                format: int32
+                minimum: 1
+                maximum: 100
+              image:
+                type: string
+              port:
+                type: integer
+                format: int32
+                minimum: 1
+                maximum: 65535
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+                enum: [Pending, Running, Degraded, Failed]
+              availableReplicas:
+                type: integer
+                format: int32
+              observedGeneration:
+                type: integer
+                format: int64
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: [type, status]
+                  properties:
+                    type:   { type: string }
+                    status: { type: string }
+                    reason: { type: string }
+                    message: { type: string }
+                    lastTransitionTime: { type: string, format: date-time }
+                    observedGeneration: { type: integer }
+```
+
+### Why each field matters
+
+**`name: webapps.apps.example.com`:**
+The CRD's own Kubernetes name must follow the format `plural.group`.
+This is how the API server looks up the CRD definition when it receives
+a request for `apps.example.com/v1/webapps`.
+
+**`scope: Namespaced`:**
+Namespaced means `WebApp` resources belong to a namespace (like Pods,
+Services). Cluster scope means they are global (like Nodes, StorageClasses).
+Choose based on your use case — most application-level CRDs are Namespaced.
+
+**`served: true` vs `storage: true`:**
+`served` means the API server accepts requests for this version.
+`storage` means objects are stored in etcd using this version's schema.
+Only one version can be `storage: true`. Multiple versions can be `served: true`
+(for backward compatibility during version migrations).
+
+**`subresources: status: {}`:**
+This creates a separate HTTP endpoint `/apis/apps.example.com/v1/namespaces/{ns}/webapps/{name}/status`.
+It enables:
+- Separate RBAC: you can grant a controller `update` on `webapps/status`
+  without granting `update` on `webapps` (which could let it change spec)
+- When a user does `kubectl apply`, only the spec is updated
+- When the controller calls `Status().Update()`, only the status is updated
+  — they do not overwrite each other
+
+**`openAPIV3Schema`:**
+The API server validates all create and update requests against this schema
+before accepting them. Invalid objects are rejected with a clear error
+message — before your controller ever sees them. This is much better than
+discovering invalid input in your reconciler.
+
+---
+
+## Step 3 — The Controller
+
+### File: `internal/controller/webapp_controller.go`
+
+```go
+package controller
+
+import (
+    "context"
+    "fmt"
+
+    appsv1 "k8s.io/api/apps/v1"
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/api/errors"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/runtime"
+    "k8s.io/apimachinery/pkg/util/intstr"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+    "sigs.k8s.io/controller-runtime/pkg/log"
+
+    myapiv1 "github.com/example/webapp-controller/api/v1"
+)
+
+const webappFinalizer = "apps.example.com/finalizer"
+
+// WebAppReconciler reconciles WebApp objects
+// RBAC markers — controller-gen generates ClusterRole from these
+// +kubebuilder:rbac:groups=apps.example.com,resources=webapps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps.example.com,resources=webapps/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps.example.com,resources=webapps/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+type WebAppReconciler struct {
+    client.Client   // embedded — gives us r.Get(), r.List(), r.Create(), etc.
+    Scheme *runtime.Scheme
+}
+
+// Reconcile is the core function — called whenever a WebApp changes
+// or a related resource (Deployment, Service) changes
+func (r *WebAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+    log.Info("Reconciling WebApp", "name", req.Name, "namespace", req.Namespace)
+
+    // ── Step 1: Fetch the WebApp resource ─────────────────────────────────
+    webapp := &myapiv1.WebApp{}
+    if err := r.Get(ctx, req.NamespacedName, webapp); err != nil {
+        if errors.IsNotFound(err) {
+            // Object deleted before we could reconcile — nothing to do
+            // Owned resources (Deployment, Service) cleaned up by GC via OwnerReference
+            return ctrl.Result{}, nil
+        }
+        // Real error — requeue with exponential backoff
+        return ctrl.Result{}, fmt.Errorf("failed to get WebApp: %w", err)
+    }
+
+    // ── Step 2: Handle deletion (finalizer pattern) ────────────────────────
+    if !webapp.DeletionTimestamp.IsZero() {
+        // Object is being deleted — run cleanup before allowing deletion
+        if controllerutil.ContainsFinalizer(webapp, webappFinalizer) {
+            if err := r.cleanupExternalResources(ctx, webapp); err != nil {
+                return ctrl.Result{}, err
+            }
+            // Remove finalizer — Kubernetes will now complete deletion
+            controllerutil.RemoveFinalizer(webapp, webappFinalizer)
+            if err := r.Update(ctx, webapp); err != nil {
+                return ctrl.Result{}, err
+            }
+        }
+        return ctrl.Result{}, nil
+    }
+
+    // ── Step 3: Add finalizer if not present ──────────────────────────────
+    if !controllerutil.ContainsFinalizer(webapp, webappFinalizer) {
+        controllerutil.AddFinalizer(webapp, webappFinalizer)
+        if err := r.Update(ctx, webapp); err != nil {
+            return ctrl.Result{}, err
+        }
+        // Return here — Update triggers a new reconcile
+        return ctrl.Result{}, nil
+    }
+
+    // ── Step 4: Reconcile the Deployment ──────────────────────────────────
+    deployment, err := r.reconcileDeployment(ctx, webapp)
+    if err != nil {
+        r.setCondition(webapp, "DeploymentReady", metav1.ConditionFalse,
+            "DeploymentFailed", err.Error())
+        r.updateStatus(ctx, webapp, "Failed", 0)
+        return ctrl.Result{}, err
+    }
+
+    // ── Step 5: Reconcile the Service ─────────────────────────────────────
+    if err := r.reconcileService(ctx, webapp); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // ── Step 6: Update status based on Deployment state ───────────────────
+    available := deployment.Status.AvailableReplicas
+    phase := "Running"
+    if available == 0 {
+        phase = "Pending"
+    } else if available < webapp.Spec.Replicas {
+        phase = "Degraded"
+    }
+
+    r.setCondition(webapp, "DeploymentReady", metav1.ConditionTrue,
+        "DeploymentAvailable", fmt.Sprintf("%d/%d replicas available", available, webapp.Spec.Replicas))
+
+    if err := r.updateStatus(ctx, webapp, phase, available); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    log.Info("Reconciliation complete", "phase", phase, "available", available)
+    return ctrl.Result{}, nil
+}
+
+// reconcileDeployment creates or updates the Deployment owned by this WebApp
+func (r *WebAppReconciler) reconcileDeployment(ctx context.Context, webapp *myapiv1.WebApp) (*appsv1.Deployment, error) {
+    labels := map[string]string{
+        "app":                          webapp.Name,
+        "app.kubernetes.io/managed-by": "webapp-controller",
+    }
+
+    replicas := webapp.Spec.Replicas
+    desired := &appsv1.Deployment{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      webapp.Name,
+            Namespace: webapp.Namespace,
+            Labels:    labels,
+        },
+        Spec: appsv1.DeploymentSpec{
+            Replicas: &replicas,
+            Selector: &metav1.LabelSelector{MatchLabels: labels},
+            Template: corev1.PodTemplateSpec{
+                ObjectMeta: metav1.ObjectMeta{Labels: labels},
+                Spec: corev1.PodSpec{
+                    Containers: []corev1.Container{{
+                        Name:  "app",
+                        Image: webapp.Spec.Image,
+                        Ports: []corev1.ContainerPort{{
+                            ContainerPort: webapp.Spec.Port,
+                        }},
+                    }},
+                },
+            },
+        },
+    }
+
+    // Set WebApp as the owner of the Deployment
+    // When WebApp is deleted, Kubernetes automatically deletes the Deployment
+    if err := controllerutil.SetControllerReference(webapp, desired, r.Scheme); err != nil {
+        return nil, err
+    }
+
+    // CreateOrUpdate: if Deployment doesn't exist, create it
+    // If it exists, update it to match desired state
+    existing := &appsv1.Deployment{}
+    result, err := controllerutil.CreateOrUpdate(ctx, r.Client, existing, func() error {
+        // Copy name/namespace for lookup
+        existing.Name = desired.Name
+        existing.Namespace = desired.Namespace
+        // Mutate to desired state
+        existing.Spec = desired.Spec
+        existing.Labels = desired.Labels
+        return nil
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to reconcile Deployment: %w", err)
+    }
+
+    if result != controllerutil.OperationResultNone {
+        log.FromContext(ctx).Info("Deployment reconciled", "result", result)
+    }
+
+    // Re-fetch to get current status
+    if err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing); err != nil {
+        return nil, err
+    }
+    return existing, nil
+}
+
+// reconcileService creates or updates the Service for this WebApp
+func (r *WebAppReconciler) reconcileService(ctx context.Context, webapp *myapiv1.WebApp) error {
+    labels := map[string]string{"app": webapp.Name}
+
+    desired := &corev1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      webapp.Name,
+            Namespace: webapp.Namespace,
+            Labels:    labels,
+        },
+        Spec: corev1.ServiceSpec{
+            Selector: labels,
+            Ports: []corev1.ServicePort{{
+                Port:       webapp.Spec.Port,
+                TargetPort: intstr.FromInt32(webapp.Spec.Port),
+                Protocol:   corev1.ProtocolTCP,
+            }},
+            Type: corev1.ServiceTypeClusterIP,
+        },
+    }
+
+    if err := controllerutil.SetControllerReference(webapp, desired, r.Scheme); err != nil {
+        return err
+    }
+
+    existing := &corev1.Service{}
+    _, err := controllerutil.CreateOrUpdate(ctx, r.Client, existing, func() error {
+        existing.Name = desired.Name
+        existing.Namespace = desired.Namespace
+        existing.Spec.Selector = desired.Spec.Selector
+        existing.Spec.Ports = desired.Spec.Ports
+        // Note: do NOT overwrite existing.Spec.ClusterIP — it is assigned by k8s
+        return nil
+    })
+    return err
+}
+
+// updateStatus updates the WebApp's status subresource
+func (r *WebAppReconciler) updateStatus(ctx context.Context, webapp *myapiv1.WebApp, phase string, available int32) error {
+    webapp.Status.Phase = phase
+    webapp.Status.AvailableReplicas = available
+    // ObservedGeneration tells users the controller processed this generation of spec
+    webapp.Status.ObservedGeneration = webapp.Generation
+    // Status().Update() only modifies the status subresource
+    // It does NOT touch spec — separate API endpoint
+    return r.Status().Update(ctx, webapp)
+}
+
+// setCondition updates a condition in the status
+func (r *WebAppReconciler) setCondition(webapp *myapiv1.WebApp, condType string,
+    status metav1.ConditionStatus, reason, message string) {
+    // Uses controller-runtime's meta helper — handles LastTransitionTime and deduplication
+    // meta.SetStatusCondition(&webapp.Status.Conditions, metav1.Condition{...})
+}
+
+// cleanupExternalResources runs before finalizer removal
+// Use this for resources outside Kubernetes (cloud LBs, DNS records, databases)
+func (r *WebAppReconciler) cleanupExternalResources(ctx context.Context, webapp *myapiv1.WebApp) error {
+    // Kubernetes resources (Deployment, Service) are cleaned up automatically
+    // via OwnerReference garbage collection — no manual cleanup needed here
+    // Only use this for resources Kubernetes cannot garbage collect:
+    //   - AWS Route53 DNS records
+    //   - External load balancers created via cloud API
+    //   - Database users or schemas
+    log.FromContext(ctx).Info("Running external cleanup for WebApp", "name", webapp.Name)
+    return nil
+}
+
+// SetupWithManager wires the controller to watch WebApp and owned resources
+func (r *WebAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        // Primary resource — reconcile when WebApp changes
+        For(&myapiv1.WebApp{}).
+        // Secondary resources — reconcile the WebApp when owned Deployment changes
+        // The controller maps Deployment → owning WebApp → enqueues WebApp for reconcile
+        Owns(&appsv1.Deployment{}).
+        // Also watch Services
+        Owns(&corev1.Service{}).
+        // Limit concurrent reconciles (default 1 — safe for most cases)
+        WithOptions(controller.Options{MaxConcurrentReconciles: 2}).
+        Complete(r)
+}
+```
+
+### Why each section matters
+
+**`r.Get()` returning `IsNotFound`:**
+The most common beginner mistake is panicking or returning an error when the
+object is not found. Not found simply means the object was deleted between
+the event being enqueued and the reconciler running — return `nil` (success)
+and do nothing. The owned resources (Deployment, Service) will be cleaned up
+by Kubernetes garbage collection via OwnerReferences.
+
+**`DeletionTimestamp` check (finalizer pattern):**
+When a user runs `kubectl delete webapp my-webapp`, Kubernetes sets
+`DeletionTimestamp` on the object but does NOT delete it immediately if there
+are finalizers. Your controller sees the non-zero timestamp, runs cleanup
+(external resources that Kubernetes cannot garbage collect), removes the
+finalizer, and then Kubernetes completes the deletion. Without finalizers,
+Kubernetes would delete the object immediately — you would never get a chance
+to clean up external resources.
+
+**`controllerutil.SetControllerReference()`:**
+Sets the `ownerReferences` field on the Deployment and Service to point to
+the WebApp. When the WebApp is deleted, Kubernetes automatically garbage-collects
+all objects that have it as an owner. This is how you get automatic cleanup of
+secondary resources without writing any deletion logic.
+
+**`controllerutil.CreateOrUpdate()`:**
+The idempotent workhorse of every controller. It:
+1. Tries to `Get` the existing object
+2. If not found → `Create` it
+3. If found → calls your mutate function → `Update` it
+Running `Reconcile` 100 times on the same WebApp produces the same result as
+running it once — this idempotency is the core contract of the reconciler.
+
+**`r.Status().Update()` vs `r.Update()`:**
+`r.Update()` updates the full object including spec — a controller should
+almost never call this on the CR it manages (that would overwrite user intent).
+`r.Status().Update()` hits the `/status` subresource endpoint — only the
+status field is changed. This separation is critical and requires the
+`subresources: status: {}` in the CRD manifest.
+
+**`Owns(&appsv1.Deployment{})`:**
+Without this, if someone manually deletes the Deployment that the controller
+created, the controller would not know — the WebApp has not changed, so no
+event is generated. `Owns()` sets up a watch on Deployments and when a
+change occurs to an owned Deployment, the controller maps it back to the
+owning WebApp and enqueues a reconcile. This is how self-healing works.
+
+---
+
+## Step 4 — RBAC
+
+### File: `config/rbac/role.yaml`
+
+### What it is
+
+RBAC grants the controller's ServiceAccount permission to watch and
+manage Kubernetes resources. Without correct RBAC, every API call
+from the controller returns `403 Forbidden`.
+
+### How RBAC is generated
+
+The `+kubebuilder:rbac:` markers in the controller file are the source
+of truth. Running `make manifests` generates this YAML automatically:
+
+```yaml
+# config/rbac/role.yaml — generated from +kubebuilder:rbac markers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: webapp-controller-role
+rules:
+# Permission on WebApp CRs — must be able to get/list/watch to reconcile
+- apiGroups: ["apps.example.com"]
+  resources: ["webapps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# Permission on status subresource — SEPARATE from the main resource
+# Allows controller to update status without being able to change spec via update
+- apiGroups: ["apps.example.com"]
+  resources: ["webapps/status"]
+  verbs: ["get", "update", "patch"]
+
+# Permission on finalizers subresource — needed to add/remove finalizers
+- apiGroups: ["apps.example.com"]
+  resources: ["webapps/finalizers"]
+  verbs: ["update"]
+
+# Permission on secondary resources the controller creates/manages
+- apiGroups: ["apps"]                     # apps/v1 API group
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+- apiGroups: [""]                         # core API group (v1)
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# Events — for recording human-readable controller actions
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+```
+
+```yaml
+# config/rbac/service_account.yaml — the identity the controller runs as
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp-controller
+  namespace: webapp-system
+```
+
+```yaml
+# config/rbac/role_binding.yaml — connects ServiceAccount to the ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: webapp-controller-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: webapp-controller           # must match ServiceAccount name
+  namespace: webapp-system          # must match ServiceAccount namespace
+roleRef:
+  kind: ClusterRole
+  name: webapp-controller-role      # must match ClusterRole name
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Why each RBAC rule matters
+
+**`webapps` vs `webapps/status` vs `webapps/finalizers`:**
+These are three separate sub-resources with independent permissions:
+- `webapps` — read/write the spec. Grant carefully.
+- `webapps/status` — read/write only the status. Controller uses `r.Status().Update()`
+- `webapps/finalizers` — needed to call `r.Update()` when adding/removing finalizers
+
+**Why `list` and `watch` are needed (not just `get`):**
+The controller uses an informer that first `List`s all existing WebApps
+at startup, then `Watch`es for changes via a long-lived HTTP connection.
+Without `list`, the informer cannot build its initial cache.
+Without `watch`, it cannot receive change events.
+
+**Why `events` permission is needed:**
+Controllers record Events to give users visibility into what they are doing:
+```bash
+kubectl describe webapp my-webapp
+# Events:
+#   Normal   DeploymentCreated  5m    webapp-controller  Created deployment my-webapp
+#   Normal   ServiceCreated     5m    webapp-controller  Created service my-webapp
+#   Warning  DeploymentFailed   2m    webapp-controller  Image pull failed: nginx:invalid
+```
+Without events permission, these are silently dropped.
+
+---
+
+## Step 5 — Main Entry Point
+
+### File: `cmd/main.go`
+
+```go
+package main
+
+import (
+    "flag"
+    "os"
+
+    appsv1 "k8s.io/api/apps/v1"
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/runtime"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/log/zap"
+    "sigs.k8s.io/controller-runtime/pkg/healthz"
+
+    myapiv1 "github.com/example/webapp-controller/api/v1"
+    "github.com/example/webapp-controller/internal/controller"
+)
+
+var scheme = runtime.NewScheme()
+
+func init() {
+    // Register ALL types that the controller will read or write
+    // Without registration, the client cannot serialize/deserialize the objects
+    _ = myapiv1.AddToScheme(scheme)   // our WebApp types
+    _ = appsv1.AddToScheme(scheme)    // Deployment
+    _ = corev1.AddToScheme(scheme)    // Service, Event
+}
+
+func main() {
+    var metricsAddr string
+    var probeAddr string
+    var enableLeaderElection bool
+
+    flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics address")
+    flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe address")
+    flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election")
+    flag.Parse()
+
+    ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+    // Manager is the central orchestrator — owns cache, controllers, webhook server
+    mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+        Scheme:                 scheme,
+        MetricsBindAddress:     metricsAddr,
+        HealthProbeBindAddress: probeAddr,
+        LeaderElection:         enableLeaderElection,
+        LeaderElectionID:       "webapp-controller.apps.example.com",
+        // Namespace: "default", // uncomment to restrict to one namespace
+    })
+    if err != nil {
+        ctrl.Log.Error(err, "Unable to create manager")
+        os.Exit(1)
+    }
+
+    // Register our reconciler with the manager
+    if err := (&controller.WebAppReconciler{
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+    }).SetupWithManager(mgr); err != nil {
+        ctrl.Log.Error(err, "Unable to create controller")
+        os.Exit(1)
+    }
+
+    // Health checks — used by Kubernetes liveness and readiness probes
+    mgr.AddHealthzCheck("healthz", healthz.Ping)
+    mgr.AddReadyzCheck("readyz", mgr.GetCache().WaitForCacheSync)
+
+    // Start all controllers — blocks until SIGTERM/SIGINT
+    ctrl.Log.Info("Starting manager")
+    if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+        ctrl.Log.Error(err, "Problem running manager")
+        os.Exit(1)
+    }
+}
+```
+
+**Why `init()` registers schemes:**
+The `runtime.Scheme` is a lookup table: `(Group, Version, Kind) → Go type`.
+When the controller receives `GET /apis/apps.example.com/v1/webapps/my-webapp`,
+the client library uses the scheme to know which Go struct to deserialize
+the JSON into. If `WebApp` is not registered → deserialization fails with
+a cryptic "no kind registered" error.
+
+**Why `LeaderElection` matters:**
+If you run multiple replicas of the controller for high availability (HA),
+only one should actively reconcile at a time — otherwise you get multiple
+controllers simultaneously creating/updating the same resources, causing
+race conditions. Leader election uses a Kubernetes `Lease` object — only
+the current leader holds the lease and runs the reconcile loop. Others
+stand by and take over if the leader fails.
+
+---
+
+## Step 6 — Controller Deployment
+
+### File: `config/manager/manager.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-controller
+  namespace: webapp-system
+  labels:
+    app: webapp-controller
+spec:
+  replicas: 2                             # 2 replicas for HA with leader election
+  selector:
+    matchLabels:
+      app: webapp-controller
+  template:
+    metadata:
+      labels:
+        app: webapp-controller
+    spec:
+      # The identity the controller uses for RBAC
+      serviceAccountName: webapp-controller
+
+      # Security best practice: do not run as root
+      securityContext:
+        runAsNonRoot: true
+
+      containers:
+      - name: manager
+        image: my-registry/webapp-controller:v1.0.0
+        args:
+        - --leader-elect                  # enable leader election for HA
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+
+        # Always set both requests and limits
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+
+        # Liveness: restart if controller is broken
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+
+        # Readiness: only receive traffic when cache is synced
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        # Seccomp profile — restrict syscalls
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+
+      terminationGracePeriodSeconds: 10   # allow in-flight reconciles to finish
+```
+
+**Why `serviceAccountName: webapp-controller`:**
+This connects the pod to the ServiceAccount that has the ClusterRoleBinding
+granting it RBAC permissions. Without this, the pod uses the `default`
+ServiceAccount which has no permissions — every API call fails with 403.
+
+**Why `replicas: 2` with `--leader-elect`:**
+Two controller replicas provide high availability. If the leader pod crashes,
+the standby acquires the lease within seconds and resumes reconciliation.
+The `--leader-elect` flag activates the leader election mechanism.
+
+---
+
+## Step 7 — Complete Install Flow
+
+```bash
+# 1. Install the CRD into the cluster
+#    This registers the new API type with the API server
+kubectl apply -f config/crd/bases/apps.example.com_webapps.yaml
+
+# Verify CRD is registered:
+kubectl get crd webapps.apps.example.com
+kubectl api-resources | grep webapp
+# webapp   wa   apps.example.com/v1   true   WebApp
+
+# 2. Create the controller's namespace
+kubectl create namespace webapp-system
+
+# 3. Apply RBAC
+kubectl apply -f config/rbac/service_account.yaml
+kubectl apply -f config/rbac/role.yaml
+kubectl apply -f config/rbac/role_binding.yaml
+
+# 4. Deploy the controller
+kubectl apply -f config/manager/manager.yaml
+
+# Verify controller is running:
+kubectl get pods -n webapp-system
+# NAME                                READY   STATUS    RESTARTS
+# webapp-controller-7d9f8b-xk2p1     1/1     Running   0
+# webapp-controller-7d9f8b-ab3q2     1/1     Running   0
+
+# 5. Create a WebApp resource
+cat <<EOF | kubectl apply -f -
+apiVersion: apps.example.com/v1
+kind: WebApp
+metadata:
+  name: my-webapp
+  namespace: default
+spec:
+  replicas: 3
+  image: nginx:1.25
+  port: 8080
+EOF
+
+# 6. Watch what happens
+kubectl get webapps                      # custom columns from printcolumn
+# NAME         PHASE     REPLICAS   AVAILABLE   AGE
+# my-webapp    Running   3          3           30s
+
+kubectl describe webapp my-webapp        # full details including conditions and events
+kubectl get deployment my-webapp         # controller created this
+kubectl get service my-webapp            # controller created this
+
+# 7. Test self-healing
+kubectl delete deployment my-webapp      # manually delete the Deployment
+kubectl get deployment my-webapp         # controller recreates it within seconds
+
+# 8. Test spec update
+kubectl patch webapp my-webapp --type=merge -p '{"spec":{"replicas":5}}'
+kubectl get webapp my-webapp             # status updates to reflect new replicas
+
+# 9. Test deletion
+kubectl delete webapp my-webapp
+# Controller runs finalizer cleanup, then Deployment and Service are
+# garbage-collected automatically via OwnerReferences
+```
+
+---
+
+## Step 8 — Complete File Structure
+
+```
+webapp-controller/
+├── api/
+│   └── v1/
+│       ├── webapp_types.go          ← API struct definitions (your schema)
+│       ├── groupversion_info.go     ← group/version registration
+│       └── zz_generated.deepcopy.go ← auto-generated by controller-gen
+│
+├── internal/
+│   └── controller/
+│       ├── webapp_controller.go     ← reconcile loop, business logic
+│       └── webapp_controller_test.go ← unit + integration tests (envtest)
+│
+├── cmd/
+│   └── main.go                      ← manager setup, scheme registration
+│
+├── config/
+│   ├── crd/
+│   │   └── bases/
+│   │       └── apps.example.com_webapps.yaml  ← auto-generated CRD manifest
+│   ├── rbac/
+│   │   ├── service_account.yaml     ← controller's identity
+│   │   ├── role.yaml                ← auto-generated permissions
+│   │   └── role_binding.yaml        ← connects identity to permissions
+│   └── manager/
+│       └── manager.yaml             ← Deployment for the controller
+│
+├── Dockerfile                       ← builds the controller image
+├── Makefile                         ← generate, build, deploy commands
+└── go.mod                           ← Go module dependencies
+```
+
+---
+
+## Everything Connected — The Full Flow
+
+```
+USER                   KUBERNETES API SERVER           CONTROLLER
+ │                              │                          │
+ │  kubectl apply -f webapp.yaml│                          │
+ │─────────────────────────────►│                          │
+ │                              │ 1. Validate against      │
+ │                              │    openAPIV3Schema       │
+ │                              │ 2. Store in etcd         │
+ │                              │ 3. Notify watchers       │
+ │                              │──────────────────────────►
+ │                              │                          │ 4. Informer receives
+ │                              │                          │    ADD event
+ │                              │                          │ 5. Enqueue Request{
+ │                              │                          │    namespace/name}
+ │                              │                          │
+ │                              │                          │ 6. Reconcile() called
+ │                              │                          │    r.Get(webapp)
+ │                              │◄─────────────────────────│
+ │                              │ 7. Returns WebApp spec   │
+ │                              │──────────────────────────►
+ │                              │                          │ 8. r.Create(deployment)
+ │                              │◄─────────────────────────│
+ │                              │    stores in etcd        │
+ │                              │──────────────────────────►
+ │                              │                          │ 9. r.Create(service)
+ │                              │◄─────────────────────────│
+ │                              │    stores in etcd        │
+ │                              │──────────────────────────►
+ │                              │                          │ 10. r.Status().Update()
+ │                              │◄─────────────────────────│     phase=Running
+ │                              │    updates etcd status   │
+ │                              │                          │
+ │  kubectl get webapp          │                          │
+ │─────────────────────────────►│                          │
+ │◄─────────────────────────────│                          │
+ │  NAME      PHASE    REPLICAS │                          │
+ │  my-webapp Running  3        │                          │
+```
+
+---
+
+## Interview Summary — Why Each Component Exists
+
+| Component | File | Why it exists |
+|---|---|---|
+| **API Types** | `api/v1/webapp_types.go` | Defines the CRD schema as Go structs. Source of truth for validation, serialization, and generated CRD YAML |
+| **GroupVersion** | `api/v1/groupversion_info.go` | Registers the CRD in the runtime Scheme so the client can serialize/deserialize objects |
+| **CRD YAML** | `config/crd/bases/*.yaml` | Registers the new API type with the Kubernetes API server. Without it, `kubectl apply -f webapp.yaml` fails with "no matches for kind WebApp" |
+| **Spec/Status split** | CRD `subresources: status: {}` | Separates user intent (spec) from controller observation (status). Different RBAC, different API endpoints, no overwrites |
+| **Controller** | `internal/controller/webapp_controller.go` | Watches for WebApp events, reconciles desired vs actual state, creates/updates Deployment and Service |
+| **Reconcile function** | Controller | The core control loop — idempotent by design, must handle not-found, conflicts, and transient errors |
+| **OwnerReference** | `SetControllerReference()` | Enables automatic garbage collection of Deployment and Service when WebApp is deleted |
+| **Finalizer** | Controller | Allows controller to run cleanup before Kubernetes completes deletion |
+| **RBAC markers** | `+kubebuilder:rbac:...` | Source of truth for permissions — generates ClusterRole YAML automatically |
+| **ServiceAccount** | `config/rbac/` | Identity for the controller pod — RBAC grants permissions to this identity |
+| **Scheme registration** | `cmd/main.go init()` | Maps (Group, Version, Kind) strings to Go types for serialization |
+| **Leader election** | `--leader-elect` flag | Ensures only one controller replica is active — prevents split-brain with multiple replicas |
+| **Owns()** | `SetupWithManager()` | Triggers reconcile when owned Deployment/Service changes — enables self-healing |
+| **Controller Deployment** | `config/manager/manager.yaml` | Runs the controller as a pod in the cluster with the correct ServiceAccount |
